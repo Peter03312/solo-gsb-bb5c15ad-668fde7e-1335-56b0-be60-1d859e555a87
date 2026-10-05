@@ -68,6 +68,66 @@ Content-Type: application/json
   ]
 }
 
+### 批量预演（只读；请求体与批量写入相同，不改日志/锁定/结果/版本/快照）
+### 返回 base_version、current_result、proposed_result、diff、normalized_batch、token
+POST {{host}}/drills/{{drill}}/logs/preview
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ]
+}
+
+# 预演成功后，把响应中的 token 与 base_version 原样填入下一个请求。
+@previewToken = pv1.把预演响应中的token粘到这里
+@baseVersion = 0
+
+### 按预演确认提交（原子落库；响应与 POST /logs 一致）
+### 标识不符 409 preview_token_mismatch；
+### 版本已变化 409 preview_base_version_changed；
+### 演练已封存 409 drill_sealed（均不改变状态，需重新预演）
+POST {{host}}/drills/{{drill}}/logs/confirm
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ],
+  "base_version": {{baseVersion}},
+  "token": "{{previewToken}}"
+}
+
 ### 查看全部日志
 GET {{host}}/drills/{{drill}}/logs
 

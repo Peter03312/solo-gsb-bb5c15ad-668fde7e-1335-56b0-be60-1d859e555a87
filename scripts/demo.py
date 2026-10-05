@@ -63,6 +63,48 @@ def main(base_url: str) -> None:
         "POST", f"{base_url}/drills/{drill}/logs", {"logs": logs}
     ))
 
+    # --- 复核员提交前预演：只读，不改任何状态；确认须回传标识与基准版本 ---
+    preview_logs = [
+        {"record_no": "R7", "station": "BH7GGG", "counterpart": "BH8HHH",
+         "time": "2026-10-04T00:00:00+00:00", "band": "40m", "mode": "SSB"},
+        {"record_no": "R8", "station": "BH8HHH", "counterpart": "BH7GGG",
+         "time": "2026-10-04T00:00:06+00:00", "band": "40m", "mode": "SSB"},
+    ]
+    _st, pv = call(
+        "POST", f"{base_url}/drills/{drill}/logs/preview",
+        {"logs": preview_logs},
+    )
+    show("批量预演 R7/R8（只读，状态不变）", _st, pv)
+
+    # 篡改批次后拿原标识确认 -> 409 preview_token_mismatch，状态不变
+    tampered = [{**preview_logs[0], "time": "2026-10-04T00:00:01+00:00"},
+                preview_logs[1]]
+    show("用原标识确认被改动的批次（应 409 preview_token_mismatch）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/confirm",
+        {"logs": tampered, "base_version": pv["base_version"],
+         "token": pv["token"]},
+    ))
+
+    # 原批次 + 原标识 + 基准版本确认 -> 原子落库，结果等于预演 proposed
+    show("按预演确认提交 R7/R8", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/confirm",
+        {"logs": preview_logs, "base_version": pv["base_version"],
+         "token": pv["token"]},
+    ))
+
+    # 同一标识重放：版本已变化 -> 409 preview_base_version_changed
+    show("重放旧标识（应 409 preview_base_version_changed）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/confirm",
+        {"logs": preview_logs, "base_version": pv["base_version"],
+         "token": pv["token"]},
+    ))
+
+    # 同内容重传预演：would_advance_version=false，差异全空
+    show("同内容重传预演（不应推进版本）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/preview",
+        {"logs": [{**preview_logs[0], "station": " bh7ggg ", "band": "40M"}]},
+    ))
+
     # 同内容重传（规范化后一致）-> 版本不变
     show("R1 同内容重传（版本应不变）", *call(
         "PUT", f"{base_url}/drills/{drill}/logs/R1",

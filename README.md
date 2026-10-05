@@ -80,6 +80,10 @@
 - 批量写入整体在一个事务内：任一条非法（含批次内记录号重复）则
   **整批回滚**；若写入/更正会使**任一既有锁定失效**，同样整批拒绝、
   状态不变（`409 lock_invalidated`）；
+- **批量预演与确认**：复核员提交前可先预演同一批日志，预演**只读**，
+  返回绑定“演练 + 基准版本 + 规范化批次”的校验标识；确认时三者任一
+  对不上（含演练已封存）即拒绝且**状态不变**，通过后按批量写入语义
+  原子落库（详见 5.6 节）；
 - 并发写入通过 SQLite `BEGIN IMMEDIATE` 串行化，版本号与配对结果
   **原子更新**，不会出现版本与结果错位；
 - **封存**演练后拒绝一切写入（返回 `409`），但仍可查询最终结果；
@@ -433,6 +437,110 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/1/diff/3
 - 两个版本都必须已留存，否则 `404 snapshot_not_found`；未知演练
   `404 drill_not_found`。比较为只读，不改变任何当前状态。
 
+### 5.6 批量写入预演 / 确认（复核员提交前预演）
+
+复核员在**正式提交批量日志前**可先“预演”：请求体与
+`POST /drills/{drill_id}/logs` **完全相同**，服务在只读事务内把整批
+写入在内存中模拟一遍，返回**当前版本**、**拟写入后的完整互证结果**、
+以及配对增删、同对时差变化、未配对增删。预演沿用与正式写入完全相同的
+规范化、整批校验（非法记录、批内记录号重复）、锁定有效性与全场最优
+配对规则；**预演不改变日志、锁定、结果、版本与快照**。
+
+#### `POST /drills/{drill_id}/logs/preview` —— 预演（只读）
+
+```bash
+curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/logs/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"logs": [ { ... }, { ... } ]}'
+```
+
+响应 `200`：
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "base_version": 3,
+  "current_result": { "...": "预演时的当前互证结果（同 GET /result）" },
+  "proposed_version": 4,
+  "would_advance_version": true,
+  "proposed_result": {
+    "drill_id": "DRILL-2026",
+    "version": 4,
+    "sealed": false,
+    "pairs": [
+      {"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}
+    ],
+    "unpaired": ["R3"],
+    "total_time_diff_seconds": 5.0,
+    "recomputed_at": null
+  },
+  "diff": {
+    "pairs": {
+      "added":   [{"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}],
+      "removed": [],
+      "time_diff_changed": [
+        {"record_a": "R3", "record_b": "R6",
+         "from_time_diff_seconds": 8.0, "to_time_diff_seconds": 3.0}
+      ]
+    },
+    "unpaired": { "added": ["R3"], "removed": [] },
+    "total_time_diff_seconds": { "from": 0.0, "to": 5.0, "delta": 5.0 }
+  },
+  "normalized_batch": [
+    {"record_no": "R1", "station": "BH1AAA", "counterpart": "BH2BBB",
+     "time": "2026-10-04T00:00:00+00:00", "band": "40M", "mode": "SSB"}
+  ],
+  "token": "pv1.<不透明字符串>"
+}
+```
+
+- `base_version`：预演所基于的演练**当前版本**；
+- `current_result`：预演时的现态结果；`proposed_result`：该批正式写入
+  并全场重算后的完整结果（预演不落库，故无 `recomputed_at`）；
+- `would_advance_version`：批次是否含新增/异内容更正。**同内容重传为
+  `false`**，此时 `proposed_version == base_version`、各差异节为空；
+- `diff.pairs`：与版本比较同一口径——配对按记录对身份比较，
+  `added`/`removed` 分别取拟写入/当前内容，两版都在但时差不同的对进入
+  `time_diff_changed`；`diff.unpaired` 为未配对记录号集合差异（升序）；
+  `total_time_diff_seconds.delta = to - from`；
+- `normalized_batch`：服务端规范化（呼号/波段/模式大写、时间换算 UTC）
+  后的批次，确认时以它为准；
+- `token`：**校验标识**，绑定“演练 + 基准版本 + 规范化批次”（无状态
+  HMAC，密钥存于库内 `meta` 表，服务重启后既有演练仍可确认）。预演不
+  在服务端留存任何会话，标识仅一次性对应一次确认窗口。
+
+预演的整批报错与正式批量写入完全一致：非法记录 `422`、批内记录号重复
+`409 duplicate_record_in_batch`、批次使任一既有锁定失效
+`409 lock_invalidated`、演练已封存 `409 drill_sealed`、未知演练
+`404 drill_not_found`；报错同样不改变任何状态。
+
+#### `POST /drills/{drill_id}/logs/confirm` —— 按预演确认提交
+
+把**原批次**连同预演返回的 `base_version`、`token` 原样回传：
+
+```bash
+curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/logs/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "logs": [ { ... }, { ... } ],
+    "base_version": 3,
+    "token": "pv1.<预演返回的不透明字符串>"
+  }'
+```
+
+- 服务在写事务内核验：演练未封存 → 当前版本仍为 `base_version` →
+  标识与“演练 + 基准版本 + 规范化批次”一致；
+- **标识不匹配**（批次内容/顺序/规范化结果被改动、标识伪造、跨演练
+  使用）返回 `409 preview_token_mismatch`；**版本已变化**（预演后有
+  其他写入/锁定/解锁推进了版本）返回
+  `409 preview_base_version_changed`；**演练在预演后被封存**返回
+  `409 drill_sealed`。三种拒绝都**不改变任何状态**，需重新预演；
+- 校验通过后**完全按现有批量写入语义在一个原子事务内落库**：整批
+  upsert、有变化才全场重算并 `version + 1`、同内容重传不推进版本、
+  不产生额外的锁定/快照语义；响应与 `POST .../logs` 完全一致
+  （`ResultResponse`），因此正式确认的结果必然等于预演的
+  `proposed_result`（`recomputed_at` 除外）。
+
 ---
 
 ## 6. 错误响应与状态码
@@ -456,6 +564,8 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/1/diff/3
 | 锁定涉及的记录已被其他锁定占用 | `409` | `record_already_locked` |
 | 解除不存在的锁定 | `404` | `lock_not_found` |
 | 写入/更正使任一既有锁定失效 | `409` | `lock_invalidated`（整次写入拒绝、状态不变） |
+| 确认时校验标识与演练/基准版本/规范化批次不符 | `409` | `preview_token_mismatch`（拒绝且不改状态） |
+| 确认时演练版本已不同于预演基准版本 | `409` | `preview_base_version_changed`（拒绝且不改状态） |
 | 取回/比较未留存版本（含升级前旧版本） | `404` | `snapshot_not_found` |
 
 ---
@@ -467,7 +577,7 @@ curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/1/diff/3
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常处理、lifespan 初始化
 │   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号）
-│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定/版本快照
+│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定/快照/批量预演
 │   ├── matching.py      # 配对核心算法（二分图最小费用最大流，支持强制锁定）
 │   └── config.py        # 环境变量配置
 ├── scripts/

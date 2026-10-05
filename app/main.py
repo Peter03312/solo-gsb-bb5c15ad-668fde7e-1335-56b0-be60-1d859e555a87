@@ -11,6 +11,8 @@ from . import database
 from .config import http_host, http_port
 from .schemas import (
     BatchLogsRequest,
+    BatchPreviewResponse,
+    ConfirmBatchRequest,
     CreateDrillRequest,
     DrillResponse,
     LockActionResponse,
@@ -33,7 +35,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
@@ -127,6 +129,36 @@ def batch_logs(drill_id: str, payload: BatchLogsRequest) -> dict:
         data = entry.to_service()
         items.append(data)
     return database.batch_upsert_logs(drill_id, items)
+
+
+@app.post(
+    "/drills/{drill_id}/logs/preview",
+    response_model=BatchPreviewResponse,
+    tags=["logs"],
+    status_code=200,
+    summary="批量写入预演（只读）：当前版本、拟写入完整结果、差异与校验标识",
+)
+def preview_batch_logs(
+    drill_id: str, payload: BatchLogsRequest
+) -> dict:
+    items = [entry.to_service() for entry in payload.logs]
+    return database.preview_batch_logs(drill_id, items)
+
+
+@app.post(
+    "/drills/{drill_id}/logs/confirm",
+    response_model=ResultResponse,
+    tags=["logs"],
+    status_code=200,
+    summary="确认预演后原子提交（标识不符/版本已变化/已封存均拒绝且不改状态）",
+)
+def confirm_batch_logs(
+    drill_id: str, payload: ConfirmBatchRequest
+) -> dict:
+    items = [entry.to_service() for entry in payload.logs]
+    return database.confirm_batch_logs(
+        drill_id, items, payload.base_version, payload.token
+    )
 
 
 @app.get(

@@ -134,6 +134,61 @@ class BatchLogsRequest(StrictModel):
     logs: list[LogEntry] = Field(..., min_length=1)
 
 
+# --------------------------------------------------------------------------
+# 批量写入预演（复核员提交前预演）与确认
+# --------------------------------------------------------------------------
+class NormalizedLogItem(StrictModel):
+    """预演回传的规范化批次条目（确认时据此与校验标识核对）。"""
+
+    record_no: str
+    station: str
+    counterpart: str
+    time: str
+    band: str
+    mode: str
+
+
+class ConfirmBatchRequest(BatchLogsRequest):
+    """确认预演：提交批次、基准版本与预演返回的校验标识。"""
+
+    base_version: int = Field(
+        ..., description="预演返回的基准版本（演练当前版本须仍为该版本）"
+    )
+    token: str = Field(
+        ..., min_length=1, description="预演返回的校验标识（不透明字符串）"
+    )
+
+
+class PreviewTotalDiffSection(StrictModel):
+    from_: float = Field(..., alias="from")
+    to: float
+    delta: float
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+class PreviewDiff(StrictModel):
+    """当前 -> 拟写入：配对增删/同对时差变化、未配对增删、总时差变化。"""
+
+    pairs: PairDiffSection
+    unpaired: UnpairedDiffSection
+    total_time_diff_seconds: PreviewTotalDiffSection
+
+
+class BatchPreviewResponse(StrictModel):
+    """批量预演结果：不改变任何状态；确认时回传 base_version 与 token。"""
+
+    drill_id: str
+    base_version: int
+    current_result: ResultResponse
+    proposed_version: int
+    would_advance_version: bool
+    proposed_result: ResultResponse
+    diff: PreviewDiff
+    normalized_batch: list[NormalizedLogItem]
+    token: str
+
+
 class PairOut(BaseModel):
     record_a: str
     record_b: str
