@@ -154,6 +154,47 @@ def main(base_url: str) -> None:
         "GET", f"{base_url}/drills/{drill}/snapshots/{cur_v + 100}"
     ))
 
+    # --- 批量写入预演 / 确认（复核员提交前预演） ---
+    rehearse_logs = [
+        {"record_no": "R7", "station": "BH5EEE", "counterpart": "BH6FFF",
+         "time": "2026-10-04T00:00:00+00:00", "band": "40m", "mode": "SSB"},
+        {"record_no": "R8", "station": "BH6FFF", "counterpart": "BH5EEE",
+         "time": "2026-10-04T00:00:06+00:00", "band": "40m", "mode": "SSB"},
+    ]
+    # 预演：只读，返回当前/拟写入结果、配对增删与校验标识，状态不变
+    status, preview = call(
+        "POST", f"{base_url}/drills/{drill}/logs/rehearse",
+        {"logs": rehearse_logs},
+    )
+    show("批量写入预演（只读，R7-R8 将新增配对）", status, preview)
+    assert status == 200
+    status, still = call("GET", f"{base_url}/drills/{drill}/result")
+    print(f"\n=== 预演后结果版本不变：{still['version']}（拟写入版本 "
+          f"{preview['proposed_result']['version']}） ===")
+
+    # 篡改批次直接确认 -> 409 rehearsal_token_mismatch
+    tampered = [{**rehearse_logs[0], "time": "2026-10-04T00:00:09+00:00"},
+                rehearse_logs[1]]
+    show("标识与批次不匹配（应 409 rehearsal_token_mismatch）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/commit",
+        {"logs": tampered, "base_version": preview["base_version"],
+         "token": preview["token"]},
+    ))
+
+    # 同批次 + 基准版本 + 标识确认 -> 原子落库
+    show("确认预演提交（R7-R8 配对原子落库）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/commit",
+        {"logs": rehearse_logs, "base_version": preview["base_version"],
+         "token": preview["token"]},
+    ))
+
+    # 版本已推进后再用旧标识确认 -> 409 rehearsal_version_conflict
+    show("基准版本已变化（应 409 rehearsal_version_conflict）", *call(
+        "POST", f"{base_url}/drills/{drill}/logs/commit",
+        {"logs": rehearse_logs, "base_version": preview["base_version"],
+         "token": preview["token"]},
+    ))
+
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))
 
     # 封存不产生新快照；封存状态从现态读取（旧快照 sealed 也为 true）

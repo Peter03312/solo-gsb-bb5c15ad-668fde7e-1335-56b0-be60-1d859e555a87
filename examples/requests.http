@@ -71,6 +71,68 @@ Content-Type: application/json
 ### 查看全部日志
 GET {{host}}/drills/{{drill}}/logs
 
+### 批量写入预演（只读）：不改变日志/锁定/结果/版本/快照
+### 返回当前版本 current_result、拟写入 proposed_result、
+### 配对增删/同对时差变化/未配对增删（changes）、规范化批次与校验标识 token。
+### 非法记录 422、批内记录号重复 409、锁定失效 409、已封存 409（均整批报错）。
+# @name rehearse
+POST {{host}}/drills/{{drill}}/logs/rehearse
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R5",
+      "station": "BH5EEE",
+      "counterpart": "BH6FFF",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R6",
+      "station": "BH6FFF",
+      "counterpart": "BH5EEE",
+      "time": "2026-10-04T00:00:06+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ]
+}
+
+### 确认预演提交：回传同一批次 + 预演的 base_version + token
+### 标识不匹配 409 rehearsal_token_mismatch；
+### 预演后版本已变 409 rehearsal_version_conflict；
+### 预演后演练已封存 409 drill_sealed。成功则按批量写入语义原子落库，
+### 同内容重传不推进版本；响应与 POST /logs 完全一致。
+@token = {{rehearse.body.token}}
+@base = {{rehearse.body.base_version}}
+POST {{host}}/drills/{{drill}}/logs/commit
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R5",
+      "station": "BH5EEE",
+      "counterpart": "BH6FFF",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R6",
+      "station": "BH6FFF",
+      "counterpart": "BH5EEE",
+      "time": "2026-10-04T00:00:06+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ],
+  "base_version": {{base}},
+  "token": "{{token}}"
+}
+
 ### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
 GET {{host}}/drills/{{drill}}/result
 

@@ -134,6 +134,83 @@ class BatchLogsRequest(StrictModel):
     logs: list[LogEntry] = Field(..., min_length=1)
 
 
+class RehearseCommitRequest(BatchLogsRequest):
+    """确认预演提交：批量日志（与预演同一请求体）+ 基准版本 + 校验标识。"""
+
+    base_version: int = Field(
+        ..., description="预演返回的基准版本（当前版本）"
+    )
+    token: str = Field(..., min_length=1, description="预演返回的校验标识")
+
+    @field_validator("base_version")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("基准版本不能为负数")
+        return v
+
+    @field_validator("token")
+    @classmethod
+    def _token_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("校验标识不能为空")
+        return v
+
+
+class NormalizedLogItem(StrictModel):
+    """服务端规范化后的单条日志（预演回显，确认时原样回传即可）。"""
+
+    record_no: str
+    station: str
+    counterpart: str
+    ts_micros: int
+    time: str
+    band: str
+    mode: str
+
+
+class RehearsePairDiffSection(StrictModel):
+    """预演前后的配对增删与同对时差变化。"""
+
+    added: list[PairOut]
+    removed: list[PairOut]
+    time_diff_changed: list[PairDiff]
+
+
+class RehearseUnpairedDiffSection(StrictModel):
+    """预演前后未配对记录的新增/移除。"""
+
+    added: list[str]
+    removed: list[str]
+
+
+class RehearsalChanges(StrictModel):
+    """拟写入后相对当前互证结果的差异。"""
+
+    pairs: RehearsePairDiffSection
+    unpaired: RehearseUnpairedDiffSection
+    total_time_diff_seconds: TotalDiffSection
+
+
+class RehearseResponse(StrictModel):
+    """批量写入预演结果：当前版本/结果 + 拟写入结果 + 差异 + 校验标识。
+
+    预演为只读：不改变日志、锁定、结果、版本与快照；``would_change_version``
+    标明按现有批量写入语义确认时是否会真正推进版本（同内容重传不推进）。
+    """
+
+    drill_id: str
+    base_version: int
+    sealed: bool
+    current_result: ResultResponse
+    proposed_result: ResultResponse
+    would_change_version: bool
+    changes: RehearsalChanges
+    normalized_logs: list[NormalizedLogItem]
+    token: str
+
+
 class PairOut(BaseModel):
     record_a: str
     record_b: str

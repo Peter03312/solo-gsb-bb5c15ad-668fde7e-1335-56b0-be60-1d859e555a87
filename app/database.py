@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, Sequence
 
+from . import rehearsal as rehearsal_tokens
 from . import config
 from .matching import (
     InvalidLockError,
@@ -86,6 +88,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at                 TEXT NOT NULL,
     PRIMARY KEY (drill_id, version),
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
+);
+
+-- 服务级元数据：批量写入预演校验标识（HMAC）的签名密钥。
+-- 密钥只在本服务验签时使用，不随预演/批次落库；启动初始化时幂等生成。
+CREATE TABLE IF NOT EXISTS service_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
 );
 """
 
@@ -173,6 +182,20 @@ class SnapshotNotFoundError(ServiceError):
     error_code = "snapshot_not_found"
 
 
+class RehearsalTokenMismatchError(ServiceError):
+    """确认提交的校验标识与演练/基准版本/规范化批次不匹配。"""
+
+    status_code = 409
+    error_code = "rehearsal_token_mismatch"
+
+
+class RehearsalVersionConflictError(ServiceError):
+    """预演后基准版本已变化（他人已推进版本或演练已封存）。"""
+
+    status_code = 409
+    error_code = "rehearsal_version_conflict"
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -201,10 +224,53 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
+        _ensure_service_secret(conn)
         # 升级既有库：从升级时的当前版本开始留存快照；更早的版本不补造。
         _backfill_legacy_snapshots(conn)
     finally:
         conn.close()
+
+
+_SERVICE_SECRET_KEY = "rehearsal_hmac_secret"
+
+
+def _ensure_service_secret(conn: sqlite3.Connection) -> str:
+    """幂等取得预演签名密钥：不存在则在独立写事务中生成留存。"""
+    row = conn.execute(
+        "SELECT value FROM service_meta WHERE key = ?",
+        (_SERVICE_SECRET_KEY,),
+    ).fetchone()
+    if row is not None:
+        return row["value"]
+    secret = secrets.token_hex(32)
+    with _write_tx(conn):
+        conn.execute(
+            "INSERT INTO service_meta (key, value) VALUES (?, ?)",
+            (_SERVICE_SECRET_KEY, secret),
+        )
+    return secret
+
+
+def _get_service_secret(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT value FROM service_meta WHERE key = ?",
+        (_SERVICE_SECRET_KEY,),
+    ).fetchone()
+    if row is None:  # 理论上不会发生（启动初始化幂等生成）
+        return _ensure_service_secret(conn)
+    return row["value"]
+
+
+@contextmanager
+def _read_tx(conn: sqlite3.Connection):
+    """只读事务（延迟事务，不取写锁）：保证整段预演读取同一快照。"""
+    conn.execute("BEGIN")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _backfill_legacy_snapshots(conn: sqlite3.Connection) -> None:
@@ -527,14 +593,8 @@ def upsert_log(
         conn.close()
 
 
-def batch_upsert_logs(
-    drill_id: str, items: Iterable[dict]
-) -> dict:
-    """批量写入/更正：整体一个事务，任一非法则整批拒绝。
-
-    批次内同一记录号出现多次视为非法（无法判定终态）。
-    """
-    items = list(items)
+def _check_batch_unique(items: Sequence[dict]) -> None:
+    """批次内同一记录号出现多次视为非法（无法判定终态）。"""
     seen: set[str] = set()
     for it in items:
         if it["record_no"] in seen:
@@ -543,50 +603,249 @@ def batch_upsert_logs(
             )
         seen.add(it["record_no"])
 
+
+def _apply_batch_items(
+    conn: sqlite3.Connection, drill_id: str, items: Sequence[dict]
+) -> bool:
+    """在写事务内按 upsert 语义应用规范化批次，返回是否有任何内容变化。
+
+    与单条写入一致：记录不存在则插入；规范化后内容不同则更正；
+    规范化后完全相同则视为重传（不动该行）。
+    """
+    changed = False
+    for it in items:
+        record_no = it["record_no"]
+        ts_micros = it["ts_micros"]
+        ts_iso = _micros_to_iso(ts_micros)
+        row = conn.execute(
+            "SELECT * FROM logs WHERE drill_id = ? AND record_no = ?",
+            (drill_id, record_no),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO logs (drill_id, record_no, station, "
+                "counterpart, ts_micros, ts_iso, band, mode, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    drill_id, record_no, it["station"],
+                    it["counterpart"], ts_micros, ts_iso,
+                    it["band"], it["mode"], _now_iso(),
+                ),
+            )
+            changed = True
+        elif (
+            row["station"], row["counterpart"], row["ts_micros"],
+            row["band"], row["mode"],
+        ) != (
+            it["station"], it["counterpart"], ts_micros,
+            it["band"], it["mode"],
+        ):
+            conn.execute(
+                "UPDATE logs SET station = ?, counterpart = ?, "
+                "ts_micros = ?, ts_iso = ?, band = ?, mode = ?, "
+                "updated_at = ? WHERE drill_id = ? AND record_no = ?",
+                (
+                    it["station"], it["counterpart"], ts_micros,
+                    ts_iso, it["band"], it["mode"], _now_iso(),
+                    drill_id, record_no,
+                ),
+            )
+            changed = True
+    return changed
+
+
+def batch_upsert_logs(
+    drill_id: str, items: Iterable[dict]
+) -> dict:
+    """批量写入/更正：整体一个事务，任一非法则整批拒绝。
+
+    批次内同一记录号出现多次视为非法（无法判定终态）。
+    """
+    items = list(items)
+    _check_batch_unique(items)
+
     conn = connect()
     try:
-        changed = False
         with _write_tx(conn):
             drill = _get_drill_row(conn, drill_id)
             _require_unsealed(drill)
-            for it in items:
-                record_no = it["record_no"]
-                ts_micros = it["ts_micros"]
-                ts_iso = _micros_to_iso(ts_micros)
-                row = conn.execute(
-                    "SELECT * FROM logs WHERE drill_id = ? AND record_no = ?",
-                    (drill_id, record_no),
-                ).fetchone()
-                if row is None:
-                    conn.execute(
-                        "INSERT INTO logs (drill_id, record_no, station, "
-                        "counterpart, ts_micros, ts_iso, band, mode, "
-                        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            drill_id, record_no, it["station"],
-                            it["counterpart"], ts_micros, ts_iso,
-                            it["band"], it["mode"], _now_iso(),
-                        ),
-                    )
-                    changed = True
-                elif (
-                    row["station"], row["counterpart"], row["ts_micros"],
-                    row["band"], row["mode"],
-                ) != (
-                    it["station"], it["counterpart"], ts_micros,
-                    it["band"], it["mode"],
-                ):
-                    conn.execute(
-                        "UPDATE logs SET station = ?, counterpart = ?, "
-                        "ts_micros = ?, ts_iso = ?, band = ?, mode = ?, "
-                        "updated_at = ? WHERE drill_id = ? AND record_no = ?",
-                        (
-                            it["station"], it["counterpart"], ts_micros,
-                            ts_iso, it["band"], it["mode"], _now_iso(),
-                            drill_id, record_no,
-                        ),
-                    )
-                    changed = True
+            changed = _apply_batch_items(conn, drill_id, items)
+            if changed:
+                _recompute(conn, drill_id)
+        return get_result(drill_id)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 批量写入预演（只读）与按标识确认提交：沿用现有规范化、整批校验、
+# 锁定有效性与全场最优配对规则；预演不改变任何状态。
+# --------------------------------------------------------------------------
+def _merge_batch_items(
+    records: Sequence[Record], items: Sequence[dict]
+) -> tuple[list[Record], bool]:
+    """在内存中按 upsert 语义把规范化批次应用到现存记录（不写库）。
+
+    返回 ``(拟写入后的记录列表（保持现存写入顺序，新记录按批次顺序追加）,
+    是否有任何内容变化)``，与 :func:`_apply_batch_items` 的判定逐字段一致。
+    """
+    by_no = {r.record_no: r for r in records}
+    merged = list(records)
+    changed = False
+    for it in items:
+        incoming = Record(
+            record_no=it["record_no"],
+            station=it["station"],
+            counterpart=it["counterpart"],
+            ts_micros=it["ts_micros"],
+            band=it["band"],
+            mode=it["mode"],
+        )
+        existing = by_no.get(it["record_no"])
+        if existing is None:
+            merged.append(incoming)
+            by_no[incoming.record_no] = incoming
+            changed = True
+        elif existing != incoming:
+            for i, r in enumerate(merged):
+                if r.record_no == incoming.record_no:
+                    merged[i] = incoming
+                    break
+            by_no[incoming.record_no] = incoming
+            changed = True
+    return merged, changed
+
+
+def _proposed_result(
+    drill_id: str,
+    sealed: bool,
+    base_version: int,
+    result: MatchResult,
+) -> dict:
+    """把预演算出的拟写入结果组装为与 GET /result 同构的负载。"""
+    return {
+        "drill_id": drill_id,
+        "version": base_version + 1,
+        "sealed": sealed,
+        "pairs": [
+            {
+                "record_a": p.record_a,
+                "record_b": p.record_b,
+                "time_diff_seconds": p.time_diff_seconds,
+            }
+            for p in result.pairs
+        ],
+        "unpaired": list(result.unpaired),
+        "total_time_diff_seconds": result.total_time_diff_seconds,
+        # 预演不重算落库，没有 recomputed_at 时间。
+        "recomputed_at": None,
+    }
+
+
+def _normalized_log_items(items: Sequence[dict]) -> list[dict]:
+    """回显服务端规范化后的批次（确认时原样回传即可）。"""
+    return [
+        {
+            "record_no": it["record_no"],
+            "station": it["station"],
+            "counterpart": it["counterpart"],
+            "ts_micros": it["ts_micros"],
+            "time": _micros_to_iso(it["ts_micros"]),
+            "band": it["band"],
+            "mode": it["mode"],
+        }
+        for it in items
+    ]
+
+
+def rehearse_batch(drill_id: str, items: Iterable[dict]) -> dict:
+    """预演批量写入：只读，不改变日志、锁定、结果、版本与快照。
+
+    沿用现有规范化（调用方完成）、整批记录号去重、封存校验、锁定有效性
+    校验与全场最优配对规则；非法记录由路由层 Pydantic 拦截（422），
+    批内重复或锁定失效在此整批报错。
+    """
+    items = list(items)
+    _check_batch_unique(items)
+
+    conn = connect()
+    try:
+        with _read_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            base_version = drill["version"]
+            sealed = bool(drill["sealed"])
+            current = _result_from_conn(conn, drill_id)
+            records = _load_records(conn, drill_id)
+            lock_keys = _load_lock_keys(conn, drill_id)
+
+            merged, changed = _merge_batch_items(records, items)
+            try:
+                proposed_match = match_records(
+                    merged,
+                    drill["allowed_diff_secs"],
+                    locked_keys=lock_keys,
+                )
+            except InvalidLockError as exc:
+                # 拟写入使既有锁定失效：与正式批量写入同一错误，整批拒绝。
+                raise LockInvalidatedError(str(exc))
+            proposed = _proposed_result(
+                drill_id, sealed, base_version, proposed_match
+            )
+            if not changed:
+                # 同内容重传：确认时不推进版本，拟写入结果即当前结果。
+                proposed["version"] = base_version
+            changes = _rehearsal_changes(current, proposed)
+            secret = _get_service_secret(conn)
+        token = rehearsal_tokens.make_token(
+            secret, drill_id, base_version, items
+        )
+        return {
+            "drill_id": drill_id,
+            "base_version": base_version,
+            "sealed": sealed,
+            "current_result": current,
+            "proposed_result": proposed,
+            "would_change_version": changed,
+            "changes": changes,
+            "normalized_logs": _normalized_log_items(items),
+            "token": token,
+        }
+    finally:
+        conn.close()
+
+
+def commit_batch(drill_id: str, items: Iterable[dict], base_version: int,
+                 token: str) -> dict:
+    """按预演标识确认提交：标识/基准版本不匹配或演练已封存则拒绝。
+
+    通过校验后按现有批量写入语义在单事务内原子落库；同内容重传不推进
+    版本，响应与 ``POST /drills/{id}/logs`` 完全一致（接口兼容）。
+    """
+    items = list(items)
+    _check_batch_unique(items)
+
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            secret = _get_service_secret(conn)
+            # 先验证标识本身（按提交方给出的基准版本与规范化批次验签）：
+            # 标识不匹配（批次被改、基准号被改、伪造/演练错绑）直接拒绝。
+            if not rehearsal_tokens.verify_token(
+                secret, token, drill_id, base_version, items
+            ):
+                raise RehearsalTokenMismatchError(
+                    "校验标识与演练、基准版本或规范化批次不匹配"
+                )
+            # 标识真实有效，但预演后版本已被他人推进 -> 乐观并发冲突。
+            if drill["version"] != base_version:
+                raise RehearsalVersionConflictError(
+                    f"基准版本已变化：预演基准为 {base_version}，"
+                    f"当前版本为 {drill['version']}"
+                )
+            changed = _apply_batch_items(conn, drill_id, items)
             if changed:
                 _recompute(conn, drill_id)
         return get_result(drill_id)
@@ -919,16 +1178,14 @@ def list_snapshots(drill_id: str) -> dict:
         conn.close()
 
 
-def _diff_snapshots(
-    from_snap: dict, to_snap: dict
-) -> dict:
-    """比较两个已留存快照：按记录号稳定排序列出配对、未配对、锁定的
-    新增/移除；同一记录对的时差变化单列。
-
-    ``added`` 以 to（新）版本内容为准，``removed`` 以 from（旧）版本为准。
-    """
-    pairs_old = sorted(from_snap["pairs"], key=lambda p: (p["record_a"], p["record_b"]))
-    pairs_new = sorted(to_snap["pairs"], key=lambda p: (p["record_a"], p["record_b"]))
+def _diff_pairs_section(pairs_from: list[dict], pairs_to: list[dict]) -> dict:
+    """配对按身份比较：added 取新版、removed 取旧版，同对时差变化单列。"""
+    pairs_old = sorted(
+        pairs_from, key=lambda p: (p["record_a"], p["record_b"])
+    )
+    pairs_new = sorted(
+        pairs_to, key=lambda p: (p["record_a"], p["record_b"])
+    )
     old_map = {(p["record_a"], p["record_b"]): p for p in pairs_old}
     new_map = {(p["record_a"], p["record_b"]): p for p in pairs_new}
 
@@ -945,41 +1202,76 @@ def _diff_snapshots(
         if old_map[key]["time_diff_seconds"]
         != new_map[key]["time_diff_seconds"]
     ]
+    return {
+        "added": [new_map[k] for k in added_keys],
+        "removed": [old_map[k] for k in removed_keys],
+        "time_diff_changed": pair_time_diff_changed,
+    }
 
+
+def _diff_unpaired_section(unpaired_from: list[str], unpaired_to: list[str]):
+    """未配对记录按记录号集合比较，升序列出新增/移除。"""
+    return {
+        "added": sorted(set(unpaired_to) - set(unpaired_from)),
+        "removed": sorted(set(unpaired_from) - set(unpaired_to)),
+    }
+
+
+def _diff_locks_section(locks_from: list[dict], locks_to: list[dict]) -> dict:
+    """锁定按记录对身份比较（仅时差变化不出现，其时差已在配对节体现）。"""
     locks_old = sorted(
-        from_snap["locks"], key=lambda l: (l["record_a"], l["record_b"])
+        locks_from, key=lambda l: (l["record_a"], l["record_b"])
     )
     locks_new = sorted(
-        to_snap["locks"], key=lambda l: (l["record_a"], l["record_b"])
+        locks_to, key=lambda l: (l["record_a"], l["record_b"])
     )
     old_lock = {(l["record_a"], l["record_b"]): l for l in locks_old}
     new_lock = {(l["record_a"], l["record_b"]): l for l in locks_new}
+    return {
+        "added": [new_lock[k] for k in sorted(set(new_lock) - set(old_lock))],
+        "removed": [old_lock[k] for k in sorted(set(old_lock) - set(new_lock))],
+    }
 
+
+def _diff_total_section(total_from: float, total_to: float) -> dict:
+    return {"from": total_from, "to": total_to, "delta": total_to - total_from}
+
+
+def _rehearsal_changes(current: dict, proposed: dict) -> dict:
+    """预演差异：配对增删、同对时差变化、未配对增删、总时差变化。"""
+    return {
+        "pairs": _diff_pairs_section(current["pairs"], proposed["pairs"]),
+        "unpaired": _diff_unpaired_section(
+            current["unpaired"], proposed["unpaired"]
+        ),
+        "total_time_diff_seconds": _diff_total_section(
+            current["total_time_diff_seconds"],
+            proposed["total_time_diff_seconds"],
+        ),
+    }
+
+
+def _diff_snapshots(
+    from_snap: dict, to_snap: dict
+) -> dict:
+    """比较两个已留存快照：按记录号稳定排序列出配对、未配对、锁定的
+    新增/移除；同一记录对的时差变化单列。
+
+    ``added`` 以 to（新）版本内容为准，``removed`` 以 from（旧）版本为准。
+    """
     return {
         "drill_id": to_snap["drill_id"],
         "from_version": from_snap["version"],
         "to_version": to_snap["version"],
-        "pairs": {
-            "added": [new_map[k] for k in added_keys],
-            "removed": [old_map[k] for k in removed_keys],
-            "time_diff_changed": pair_time_diff_changed,
-        },
-        "unpaired": {
-            "added": sorted(set(to_snap["unpaired"]) - set(from_snap["unpaired"])),
-            "removed": sorted(set(from_snap["unpaired"]) - set(to_snap["unpaired"])),
-        },
-        "locks": {
-            "added": [new_lock[k] for k in sorted(set(new_lock) - set(old_lock))],
-            "removed": [old_lock[k] for k in sorted(set(old_lock) - set(new_lock))],
-        },
-        "total_time_diff_seconds": {
-            "from": from_snap["total_time_diff_seconds"],
-            "to": to_snap["total_time_diff_seconds"],
-            "delta": (
-                to_snap["total_time_diff_seconds"]
-                - from_snap["total_time_diff_seconds"]
-            ),
-        },
+        "pairs": _diff_pairs_section(from_snap["pairs"], to_snap["pairs"]),
+        "unpaired": _diff_unpaired_section(
+            from_snap["unpaired"], to_snap["unpaired"]
+        ),
+        "locks": _diff_locks_section(from_snap["locks"], to_snap["locks"]),
+        "total_time_diff_seconds": _diff_total_section(
+            from_snap["total_time_diff_seconds"],
+            to_snap["total_time_diff_seconds"],
+        ),
     }
 
 

@@ -17,6 +17,8 @@ from .schemas import (
     LockListResponse,
     LockRequest,
     LogEntry,
+    RehearseCommitRequest,
+    RehearseResponse,
     ResultResponse,
     SnapshotDiffResponse,
     SnapshotListResponse,
@@ -33,11 +35,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
-        "支持版本化更正、并发原子写入与演练封存。"
+        "支持版本化更正、并发原子写入、演练封存与批量写入预演/确认。"
     ),
     lifespan=lifespan,
 )
@@ -122,11 +124,34 @@ def upsert_log(drill_id: str, record_no: str, entry: LogEntry) -> dict:
     summary="批量写入/更正日志（整体事务，任一非法整批拒绝）",
 )
 def batch_logs(drill_id: str, payload: BatchLogsRequest) -> dict:
-    items = []
-    for entry in payload.logs:
-        data = entry.to_service()
-        items.append(data)
+    items = [entry.to_service() for entry in payload.logs]
     return database.batch_upsert_logs(drill_id, items)
+
+
+@app.post(
+    "/drills/{drill_id}/logs/rehearse",
+    response_model=RehearseResponse,
+    tags=["logs"],
+    status_code=200,
+    summary="批量写入预演（只读）：当前/拟写入互证结果、配对增删与同对时差变化",
+)
+def rehearse_batch_logs(drill_id: str, payload: BatchLogsRequest) -> dict:
+    items = [entry.to_service() for entry in payload.logs]
+    return database.rehearse_batch(drill_id, items)
+
+
+@app.post(
+    "/drills/{drill_id}/logs/commit",
+    response_model=ResultResponse,
+    tags=["logs"],
+    status_code=200,
+    summary="确认预演提交（批次+基准版本+校验标识；不匹配/版本已变/已封存拒绝）",
+)
+def commit_batch_logs(drill_id: str, payload: RehearseCommitRequest) -> dict:
+    items = [entry.to_service() for entry in payload.logs]
+    return database.commit_batch(
+        drill_id, items, payload.base_version, payload.token
+    )
 
 
 @app.get(
